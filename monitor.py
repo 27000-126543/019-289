@@ -6,6 +6,13 @@ import sys
 import hashlib
 from datetime import datetime, date, timedelta
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitors")
 
 
@@ -1068,7 +1075,7 @@ def cmd_assign(args):
         all_missing_categories -= col_data["categories"]
 
     if "未标注" in collector_data and len(collector_data) > 1:
-        print(f"  ⚠  {len(collector_data['未标注'])} 条样本未标注采集人，请尽快补充\n")
+        print(f"  ⚠  {collector_data['未标注']['total']} 条样本未标注采集人，请尽快补充\n")
 
     for col, data in sorted(collector_data.items()):
         if args.collector and col != args.collector:
@@ -1170,7 +1177,7 @@ def _show_welcome():
     print(f"  📊 产品召回舆情监测助手")
     print(f"{'='*60}")
     print(f"  面向舆情分析实习生和研究生团队的极简工具")
-    print(f"  三个核心命令，每天生成规范的召回观察摘要")
+    print(f"  六个命令：new / add / report / edit / weekly / assign")
     print(f"{'-'*60}")
     print(f"\n  📌 情绪分类（6 种）：")
     print(f"     愤怒 / 担忧 / 失望 / 中立 / 理解 / 支持")
@@ -1180,6 +1187,10 @@ def _show_welcome():
     print(f"     主要质疑    — 公众的疑问和追问")
     print(f"     官方回应    — 品牌/监管方的声明")
     print(f"     待核实传言  — 尚未证实的网传信息")
+    print(f"\n  📌 样本状态（3 种）：")
+    print(f"     待核实  — 默认状态，尚未核验")
+    print(f"     已核验  — 已确认内容真实性")
+    print(f"     已采用  — 已写入报告/周报")
     print(f"\n  📌 平台示例：")
     print(f"     微博、抖音、小红书、知乎、B站、新闻网站、")
     print(f"     微信公众号、政府/监管、豆瓣、论坛/贴吧")
@@ -1191,21 +1202,25 @@ def _show_welcome():
     print(f'       --reason "阪崎肠杆菌污染风险" \\')
     print(f'       --platforms "微博,抖音,新闻网站,政府/监管" \\')
     print(f'       --start 2026-06-01 --end 2026-06-19')
-    print(f"\n  2️⃣  追加样本（逐条或批量导入）：")
+    print(f"\n  2️⃣  追加样本（逐条或批量导入，可带状态）：")
     print(f'     python monitor.py add <监测编号> \\')
     print(f'       --title "多名家长反映婴儿腹泻" \\')
     print(f'       --link "https://weibo.com/..." \\')
     print(f'       --reposts 1200 --comments 856 \\')
     print(f'       --sentiment 愤怒 --category 新增爆点 \\')
     print(f'       --source "微博热搜第3位" --platform 微博 \\')
-    print(f'       --collector "张三"')
-    print(f"\n     批量导入 CSV：")
+    print(f'       --collector "张三" --status 已核验')
+    print(f"\n     批量导入 CSV（可含状态列）：")
     print(f'     python monitor.py add <监测编号> --from-csv samples.csv')
-    print(f"\n  3️⃣  生成日报（按四类结构化输出）：")
+    print(f"\n  3️⃣  生成日报（按日期和状态筛选）：")
     print(f'     python monitor.py report <监测编号> --today --top 10 --save')
-    print(f'     python monitor.py report <监测编号> --since 2026-06-15 --save')
-    print(f"\n  📋 查看所有项目：")
-    print(f'     python monitor.py list')
+    print(f'     python monitor.py report <监测编号> --status 已核验 --save')
+    print(f'     python monitor.py report <监测编号> --status "!待核实"')
+    print(f"\n  📋 更多命令：")
+    print(f'     edit   <编号> <样本ID> --status 已核验     编辑样本状态/分类等')
+    print(f'     weekly <编号> --since 2026-06-12 --save    生成 Markdown 周报')
+    print(f'     assign <编号>                              按采集人列出缺项')
+    print(f'     list                                       查看所有项目')
     print(f"\n{'='*60}\n")
 
 
@@ -1216,20 +1231,42 @@ def main():
         epilog="""
 📌 情绪分类（6 种）：愤怒 / 担忧 / 失望 / 中立 / 理解 / 支持
 📌 内容分类（4 种）：新增爆点 / 主要质疑 / 官方回应 / 待核实传言
+📌 样本状态（3 种）：待核实 / 已核验 / 已采用（默认待核实）
 📌 平台示例：微博、抖音、小红书、知乎、B站、新闻网站、政府/监管
 
 快速示例:
+  # 新建监测项目
   python monitor.py new --product "某品牌婴幼儿奶粉" --reason "阪崎肠杆菌污染风险" \\
        --platforms "微博,抖音,新闻网站,政府/监管" --start 2026-06-01 --end 2026-06-19
+
+  # 单条追加（可带状态）
   python monitor.py add abc12345 --title "多名家长反映婴儿腹泻" \\
        --link "https://..." --reposts 1200 --comments 856 --sentiment 愤怒 \\
-       --category 新增爆点 --source "微博热搜" --platform 微博 --collector 张三
+       --category 新增爆点 --source "微博热搜" --platform 微博 --collector 张三 --status 已核验
+
+  # 批量导入
   python monitor.py add abc12345 --from-csv samples.csv --collector 张三 --platform 微博
-  python monitor.py add abc12345 --from-text "title,link,情绪,分类
-家长反映腹泻,https://...,愤怒,新增爆点
-监管局通报,https://...,中立,官方回应"
+  python monitor.py add abc12345 --from-text "title,link,情绪,分类\\n标题1,url1,愤怒,新增爆点"
+
+  # 生成日报（按日期/状态筛选）
   python monitor.py report abc12345 --today --top 10 --save
   python monitor.py report abc12345 --since 2026-06-15 --until 2026-06-19 --save
+  python monitor.py report abc12345 --status 已核验
+  python monitor.py report abc12345 --status "!待核实"
+
+  # 编辑样本状态
+  python monitor.py edit abc12345 1 --status 已核验
+  python monitor.py edit abc12345 2 --category 官方回应 --sentiment 中立
+
+  # 生成周报 Markdown
+  python monitor.py weekly abc12345 --save
+  python monitor.py weekly abc12345 --since 2026-06-12 --status 已核验 --markdown
+
+  # 分工统计
+  python monitor.py assign abc12345
+  python monitor.py assign abc12345 --collector 张三
+
+  # 查看项目列表
   python monitor.py list
         """,
     )
@@ -1261,15 +1298,47 @@ def main():
                        help="批量导入 CSV 文件路径。字段顺序：标题,链接,转发,评论,情绪,分类,来源,采集人,平台")
     p_add.add_argument("--from-text", default="",
                        help='批量导入多行文本，首行为字段名。如: --from-text "title,link,情绪\\n标题1,url1,愤怒"')
+    p_add.add_argument("--status", default="",
+                       help="样本状态：待核实/已核验/已采用（默认待核实）")
 
-    p_report = subparsers.add_parser("report", help="生成结构化日报，支持日期筛选和高互动排序")
+    p_report = subparsers.add_parser("report", help="生成结构化日报，支持日期和状态筛选")
     p_report.add_argument("monitor_id", help="监测项目编号")
     p_report.add_argument("--date", default="", help="报告日期，默认今天（YYYY-MM-DD）")
     p_report.add_argument("--today", action="store_true", help="只看今日新增样本")
     p_report.add_argument("--since", default="", help="只看此日期之后新增的样本（YYYY-MM-DD）")
     p_report.add_argument("--until", default="", help="只看此日期之前新增的样本（YYYY-MM-DD）")
+    p_report.add_argument("--status", default="",
+                          help="按状态筛选，如：已核验 / !待核实 / 已核验,已采用")
     p_report.add_argument("--top", type=int, default=0, help="只显示互动量最高的 N 条样本")
     p_report.add_argument("--save", action="store_true", help="同时保存为 txt 文件")
+
+    p_edit = subparsers.add_parser("edit", help="编辑样本字段（状态、分类、情绪等）")
+    p_edit.add_argument("monitor_id", help="监测项目编号")
+    p_edit.add_argument("sample_id", type=int, help="样本编号，如 1、2、3")
+    p_edit.add_argument("--status", default="", help="改为：待核实/已核验/已采用")
+    p_edit.add_argument("--category", default="", help="改为：新增爆点/主要质疑/官方回应/待核实传言")
+    p_edit.add_argument("--sentiment", default="", help="改为：愤怒/担忧/失望/中立/理解/支持")
+    p_edit.add_argument("--title", default="", help="修改标题")
+    p_edit.add_argument("--link", default=None, help="修改链接")
+    p_edit.add_argument("--source", default=None, help="修改来源说明")
+    p_edit.add_argument("--platform", default=None, help="修改平台")
+    p_edit.add_argument("--collector", default=None, help="修改采集人")
+    p_edit.add_argument("--reposts", type=int, default=None, help="修改转发数")
+    p_edit.add_argument("--comments", type=int, default=None, help="修改评论数")
+
+    p_weekly = subparsers.add_parser("weekly", help="生成周报/阶段复盘 Markdown，适合贴进实习周报")
+    p_weekly.add_argument("monitor_id", help="监测项目编号")
+    p_weekly.add_argument("--since", default="", help="起始日期（YYYY-MM-DD），默认 7 天前")
+    p_weekly.add_argument("--until", default="", help="截止日期（YYYY-MM-DD），默认今天")
+    p_weekly.add_argument("--status", default="", help="按状态筛选，如：已核验 / !待核实")
+    p_weekly.add_argument("--save", action="store_true", help="同时保存为 .md 文件")
+    p_weekly.add_argument("--markdown", action="store_true", help="同 --save，保存 Markdown 文件")
+
+    p_assign = subparsers.add_parser("assign", help="按采集人统计缺失的平台和分类，辅助分工")
+    p_assign.add_argument("monitor_id", help="监测项目编号")
+    p_assign.add_argument("--since", default="", help="统计起始日期（默认昨天）")
+    p_assign.add_argument("--until", default="", help="统计截止日期（默认今天）")
+    p_assign.add_argument("--collector", default="", help="只看指定采集人")
 
     subparsers.add_parser("list", help="列出所有监测项目及样本数量")
 
@@ -1285,6 +1354,12 @@ def main():
         cmd_add(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "edit":
+        cmd_edit(args)
+    elif args.command == "weekly":
+        cmd_weekly(args)
+    elif args.command == "assign":
+        cmd_assign(args)
     elif args.command == "list":
         cmd_list(args)
     else:
