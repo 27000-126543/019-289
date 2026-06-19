@@ -1,9 +1,10 @@
 import argparse
+import csv
 import json
 import os
 import sys
 import hashlib
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitors")
 
@@ -166,6 +167,14 @@ CATEGORY_MAP = {
     "回应": "官方回应", "传言": "待核实传言",
 }
 
+STATUS_MAP = {
+    "待核实": "待核实", "已核验": "已核验", "已采用": "已采用",
+    "pending": "待核实", "verified": "已核验", "adopted": "已采用",
+    "未核实": "待核实", "核实中": "待核实", "已确认": "已核验",
+}
+
+VALID_STATUSES = {"待核实", "已核验", "已采用"}
+
 
 def _title_similarity(t1, t2):
     if t1 == t2:
@@ -191,9 +200,10 @@ def _check_duplicates(sample, existing_samples):
 
 
 def _build_sample(title, link, reposts, comments, sentiment_raw, category_raw,
-                  source_note, collector, platform, existing_samples):
+                  source_note, collector, platform, status_raw, existing_samples):
     sentiment = SENTIMENT_MAP.get(sentiment_raw.strip(), sentiment_raw.strip())
     category = CATEGORY_MAP.get(category_raw.strip(), category_raw.strip())
+    status = STATUS_MAP.get(status_raw.strip(), status_raw.strip()) if status_raw.strip() else "待核实"
 
     def _safe_int(v):
         try:
@@ -212,6 +222,7 @@ def _build_sample(title, link, reposts, comments, sentiment_raw, category_raw,
         "source_note": source_note.strip(),
         "collector": collector.strip() if collector else "",
         "platform": platform.strip() if platform else "",
+        "status": status,
         "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -222,6 +233,11 @@ def _build_sample(title, link, reposts, comments, sentiment_raw, category_raw,
     if category not in valid_categories:
         warnings.append(
             f"分类「{category}」不在标准分类中，请使用：{', '.join(valid_categories)}"
+        )
+
+    if status not in VALID_STATUSES:
+        warnings.append(
+            f"状态「{status}」不在标准状态中，请使用：{', '.join(VALID_STATUSES)}"
         )
 
     if not sample["link"]:
@@ -251,19 +267,20 @@ def cmd_add(args):
         print("\n  ❌ 单条追加样本必须提供 --title 参数\n")
         print(f"     使用示例：")
         print(f'     python monitor.py add {args.monitor_id} --title "标题" --link "https://..." \\')
-        print(f'       --sentiment 愤怒 --category 新增爆点 --platform 微博 --collector 张三\n')
+        print(f'       --sentiment 愤怒 --category 新增爆点 --platform 微博 --collector 张三 --status 已核验\n')
         sys.exit(1)
 
     sample, warnings = _build_sample(
         args.title, args.link, args.reposts, args.comments,
         args.sentiment, args.category, args.source,
-        args.collector, args.platform, monitor["samples"]
+        args.collector, args.platform, args.status, monitor["samples"]
     )
 
     monitor["samples"].append(sample)
     _save_monitor(monitor)
 
     print(f"\n  ✅ 样本 #{sample['id']} 已追加到监测项目 {monitor['id']}")
+    print(f"     状态:   {sample['status']}")
     if sample["collector"]:
         print(f"     采集人: {sample['collector']}")
     if sample["platform"]:
@@ -276,8 +293,7 @@ def cmd_add(args):
     print()
 
 
-def _parse_csv_line(line):
-    parts = [p.strip() for p in line.split(",")]
+def _parse_csv_line(parts):
     if len(parts) < 3:
         return None
     result = {
@@ -290,6 +306,7 @@ def _parse_csv_line(line):
         "source_note": parts[6] if len(parts) > 6 else "",
         "collector": parts[7] if len(parts) > 7 else "",
         "platform": parts[8] if len(parts) > 8 else "",
+        "status": parts[9] if len(parts) > 9 else "",
     }
     return result
 
@@ -299,15 +316,20 @@ def _parse_text_block(text):
     if not lines:
         return []
 
-    header = [h.strip() for h in lines[0].split(",")]
+    import io
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return []
+
+    header = [h.strip() for h in rows[0]]
     results = []
-    for line in lines[1:]:
-        parts = [p.strip() for p in line.split(",")]
-        if not parts or not parts[0]:
+    for parts in rows[1:]:
+        if not parts or not parts[0].strip():
             continue
         row = {}
         for i, key in enumerate(header):
-            row[key] = parts[i] if i < len(parts) else ""
+            row[key] = parts[i].strip() if i < len(parts) else ""
         results.append(row)
     return results
 
@@ -315,44 +337,46 @@ def _parse_text_block(text):
 def _batch_add_from_csv(monitor, args):
     default_collector = args.collector or ""
     default_platform = args.platform or ""
+    default_status = args.status or ""
 
     path = args.from_csv
     if not os.path.exists(path):
         print(f"\n  ❌ CSV 文件不存在: {path}\n")
         sys.exit(1)
 
-    with open(path, "r", encoding="utf-8-sig") as f:
-        lines = [l.strip() for l in f.readlines() if l.strip()]
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        rows_raw = [row for row in reader if any(cell.strip() for cell in row)]
 
-    if not lines:
+    if not rows_raw:
         print("\n  ❌ CSV 文件为空\n")
         sys.exit(1)
 
     rows = []
-    header_keywords = {"title", "标题", "link", "链接", "情绪", "分类", "sentiment", "category"}
-    first_line_lower = lines[0].lower()
+    header_keywords = {"title", "标题", "link", "链接", "情绪", "分类", "sentiment", "category", "status", "状态"}
+    first_line_lower = ",".join(rows_raw[0]).lower()
     has_header = any(kw in first_line_lower for kw in header_keywords)
 
     if has_header:
-        header = [h.strip() for h in lines[0].split(",")]
-        for line in lines[1:]:
-            parts = [p.strip() for p in line.split(",")]
+        header = [h.strip() for h in rows_raw[0]]
+        for parts in rows_raw[1:]:
             row = {}
             for i, key in enumerate(header):
-                row[key] = parts[i] if i < len(parts) else ""
+                row[key] = parts[i].strip() if i < len(parts) else ""
             rows.append(row)
     else:
-        for line in lines:
-            parsed = _parse_csv_line(line)
+        for parts in rows_raw:
+            parsed = _parse_csv_line([p.strip() for p in parts])
             if parsed:
                 rows.append(parsed)
 
-    _process_batch_import(monitor, rows, default_collector, default_platform)
+    _process_batch_import(monitor, rows, default_collector, default_platform, default_status)
 
 
 def _batch_add_from_text(monitor, args):
     default_collector = args.collector or ""
     default_platform = args.platform or ""
+    default_status = args.status or ""
 
     text = args.from_text
     if not text.strip():
@@ -364,16 +388,17 @@ def _batch_add_from_text(monitor, args):
         print("\n  ❌ 未能解析出有效数据，请确保第一行为字段名\n")
         sys.exit(1)
 
-    _process_batch_import(monitor, rows, default_collector, default_platform)
+    _process_batch_import(monitor, rows, default_collector, default_platform, default_status)
 
 
-def _process_batch_import(monitor, rows, default_collector, default_platform):
+def _process_batch_import(monitor, rows, default_collector, default_platform, default_status=""):
     success = []
     duplicates = []
     missing_source = []
     missing_platform = []
     missing_collector = []
     invalid_category = []
+    invalid_status = []
     errors = []
 
     initial_count = len(monitor["samples"])
@@ -388,6 +413,7 @@ def _process_batch_import(monitor, rows, default_collector, default_platform):
         source_note = row.get("source") or row.get("source_note") or row.get("来源") or ""
         collector = row.get("collector") or row.get("采集人") or default_collector
         platform = row.get("platform") or row.get("平台") or default_platform
+        status = row.get("status") or row.get("状态") or default_status
 
         if not title:
             errors.append(f"第 {idx} 行：缺少标题，已跳过")
@@ -396,7 +422,7 @@ def _process_batch_import(monitor, rows, default_collector, default_platform):
         sample, warnings = _build_sample(
             title, link, reposts, comments,
             sentiment, category, source_note,
-            collector, platform, monitor["samples"]
+            collector, platform, status, monitor["samples"]
         )
 
         is_duplicate = any("高度相似" in w or "完全相同" in w for w in warnings)
@@ -414,6 +440,9 @@ def _process_batch_import(monitor, rows, default_collector, default_platform):
 
         if sample["category"] not in {"新增爆点", "主要质疑", "官方回应", "待核实传言"}:
             invalid_category.append(f"#{len(monitor['samples']) + 1}")
+
+        if sample["status"] not in VALID_STATUSES:
+            invalid_status.append(f"#{len(monitor['samples']) + 1}")
 
         monitor["samples"].append(sample)
         success.append(sample)
@@ -443,6 +472,8 @@ def _process_batch_import(monitor, rows, default_collector, default_platform):
         print(f"  ⚠ 缺采集人:   {', '.join(missing_collector)}")
     if invalid_category:
         print(f"  ⚠ 分类待修正: {', '.join(invalid_category)}")
+    if invalid_status:
+        print(f"  ⚠ 状态待修正: {', '.join(invalid_status)}")
 
     if errors:
         print(f"\n  ❌ 错误：")
@@ -486,6 +517,28 @@ def _filter_samples_by_date(samples, since, until):
     return filtered
 
 
+def _filter_samples_by_status(samples, status_filter):
+    if not status_filter:
+        return samples
+    include = set()
+    exclude = set()
+    for s in status_filter.split(","):
+        s = s.strip()
+        if s.startswith("!") or s.startswith("！"):
+            exclude.add(s[1:].strip())
+        else:
+            include.add(s)
+    filtered = []
+    for s in samples:
+        status = s.get("status", "待核实")
+        if exclude and status in exclude:
+            continue
+        if include and status not in include:
+            continue
+        filtered.append(s)
+    return filtered
+
+
 def _engagement(sample):
     return sample.get("reposts", 0) + sample.get("comments", 0)
 
@@ -513,11 +566,15 @@ def cmd_report(args):
             until = _parse_date(args.until)
 
     samples = _filter_samples_by_date(all_samples, since, until)
+
+    if args.status:
+        samples = _filter_samples_by_status(samples, args.status)
+
     if not samples:
         if args.today:
-            print(f"\n  今日暂无新增样本。\n")
+            print(f"\n  今日暂无符合条件的样本。\n")
         else:
-            print(f"\n  所选日期范围内暂无样本。\n")
+            print(f"\n  所选条件下暂无样本。\n")
         sys.exit(0)
 
     if args.top:
@@ -563,12 +620,14 @@ def cmd_report(args):
             filter_info += f" | 筛选: >= {since}"
         elif until:
             filter_info += f" | 筛选: <= {until}"
+    if args.status:
+        filter_info += f" | 状态: {args.status}"
     if args.top:
         filter_info += f" | TOP {args.top} 高互动"
     lines.append(filter_info)
 
     platform_stats = {}
-    for s in all_samples:
+    for s in samples:
         plat = s.get("platform", "").strip() or "未标注"
         platform_stats[plat] = platform_stats.get(plat, 0) + 1
     target_platforms = monitor.get("platforms", [])
@@ -581,6 +640,15 @@ def cmd_report(args):
         lines.append(f"  平台分布:   {plat_str}")
     if missing_platforms:
         lines.append(f"  ⚠ 待补样本: {', '.join(missing_platforms)}")
+
+    status_stats = {}
+    for s in samples:
+        st = s.get("status", "待核实")
+        status_stats[st] = status_stats.get(st, 0) + 1
+    if status_stats:
+        st_items = sorted(status_stats.items(), key=lambda x: x[1], reverse=True)
+        st_str = ", ".join(f"{k} {v}条" for k, v in st_items)
+        lines.append(f"  状态分布:   {st_str}")
 
     lines.append("-" * 60)
 
@@ -596,6 +664,9 @@ def cmd_report(args):
             total_eng = s.get("reposts", 0) + s.get("comments", 0)
             lines.append(f"    [#{s['id']}] {s['title']}")
             meta_parts = []
+            if s.get("status"):
+                status_emoji = {"已核验": "✅", "已采用": "📌", "待核实": "⚠️"}.get(s["status"], "")
+                meta_parts.append(f"{status_emoji}{s['status']}")
             if s["sentiment"]:
                 meta_parts.append(f"情绪: {s['sentiment']}")
             if s.get("platform"):
@@ -619,6 +690,9 @@ def cmd_report(args):
             total_eng = s.get("reposts", 0) + s.get("comments", 0)
             lines.append(f"    [#{s['id']}] {s['title']}")
             meta_parts = []
+            if s.get("status"):
+                status_emoji = {"已核验": "✅", "已采用": "📌", "待核实": "⚠️"}.get(s["status"], "")
+                meta_parts.append(f"{status_emoji}{s['status']}")
             if s["sentiment"]:
                 meta_parts.append(f"情绪: {s['sentiment']}")
             if s.get("platform"):
@@ -684,6 +758,392 @@ def cmd_report(args):
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(report_text)
         print(f"\n  📄 日报已保存至: {filepath}\n")
+
+
+def cmd_edit(args):
+    _ensure_dir()
+    monitor = _load_monitor(args.monitor_id)
+
+    sample_id = args.sample_id
+    sample = next((s for s in monitor["samples"] if s["id"] == sample_id), None)
+    if not sample:
+        print(f"\n  ❌ 样本 #{sample_id} 不存在\n")
+        sys.exit(1)
+
+    if args.status:
+        new_status = STATUS_MAP.get(args.status.strip(), args.status.strip())
+        if new_status not in VALID_STATUSES:
+            print(f"\n  ❌ 无效状态「{args.status}」，请使用：{', '.join(VALID_STATUSES)}\n")
+            sys.exit(1)
+        sample["status"] = new_status
+
+    if args.category:
+        new_category = CATEGORY_MAP.get(args.category.strip(), args.category.strip())
+        valid_categories = {"新增爆点", "主要质疑", "官方回应", "待核实传言"}
+        if new_category not in valid_categories:
+            print(f"\n  ❌ 无效分类「{args.category}」，请使用：{', '.join(valid_categories)}\n")
+            sys.exit(1)
+        sample["category"] = new_category
+
+    if args.sentiment:
+        new_sentiment = SENTIMENT_MAP.get(args.sentiment.strip(), args.sentiment.strip())
+        sample["sentiment"] = new_sentiment
+
+    if args.title:
+        sample["title"] = args.title.strip()
+
+    if args.link is not None:
+        sample["link"] = args.link.strip()
+
+    if args.source is not None:
+        sample["source_note"] = args.source.strip()
+
+    if args.platform is not None:
+        sample["platform"] = args.platform.strip()
+
+    if args.collector is not None:
+        sample["collector"] = args.collector.strip()
+
+    if args.reposts is not None:
+        sample["reposts"] = args.reposts
+
+    if args.comments is not None:
+        sample["comments"] = args.comments
+
+    sample["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _save_monitor(monitor)
+
+    print(f"\n  ✅ 样本 #{sample_id} 已更新")
+    print(f"{'='*50}")
+    print(f"  标题:     {sample['title']}")
+    print(f"  状态:     {sample['status']}")
+    print(f"  分类:     {sample['category']}")
+    print(f"  情绪:     {sample['sentiment']}")
+    if sample["platform"]:
+        print(f"  平台:     {sample['platform']}")
+    if sample["collector"]:
+        print(f"  采集人:   {sample['collector']}")
+    print(f"  互动:     转发{sample['reposts']} 评论{sample['comments']}")
+    if sample["source_note"]:
+        print(f"  来源:     {sample['source_note']}")
+    if "updated_at" in sample:
+        print(f"  更新时间: {sample['updated_at']}")
+    print(f"{'='*50}\n")
+
+
+def cmd_weekly(args):
+    _ensure_dir()
+    monitor = _load_monitor(args.monitor_id)
+
+    all_samples = monitor["samples"]
+    if not all_samples:
+        print("\n  该监测项目尚无样本。\n")
+        sys.exit(0)
+
+    today = date.today()
+    default_since = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    default_until = today.strftime("%Y-%m-%d")
+
+    since = _parse_date(args.since or default_since)
+    until = _parse_date(args.until or default_until)
+
+    samples = _filter_samples_by_date(all_samples, since, until)
+    if not samples:
+        print(f"\n  {since} ~ {until} 期间暂无样本。\n")
+        sys.exit(0)
+
+    if args.status:
+        samples = _filter_samples_by_status(samples, args.status)
+
+    target_platforms = monitor.get("platforms", [])
+    valid_categories = ["新增爆点", "主要质疑", "官方回应", "待核实传言"]
+    category_labels = {
+        "新增爆点": "🔥 新增爆点",
+        "主要质疑": "❓ 主要质疑",
+        "官方回应": "📢 官方回应",
+        "待核实传言": "⚠️ 待核实传言",
+    }
+
+    platform_stats = {}
+    category_stats = {}
+    sentiment_stats = {}
+    status_stats = {}
+    collector_stats = {}
+    top_samples = sorted(samples, key=_engagement, reverse=True)[:5]
+
+    for s in samples:
+        plat = s.get("platform", "").strip() or "未标注"
+        platform_stats[plat] = platform_stats.get(plat, 0) + 1
+
+        cat = s.get("category", "未分类")
+        category_stats[cat] = category_stats.get(cat, 0) + 1
+
+        sent = s.get("sentiment", "未标注")
+        sentiment_stats[sent] = sentiment_stats.get(sent, 0) + 1
+
+        st = s.get("status", "待核实")
+        status_stats[st] = status_stats.get(st, 0) + 1
+
+        col = s.get("collector", "").strip() or "未标注"
+        collector_stats[col] = collector_stats.get(col, 0) + 1
+
+    covered_platforms = set(platform_stats.keys()) & set(target_platforms)
+    missing_platforms = [p for p in target_platforms if p not in covered_platforms]
+
+    md = []
+    md.append(f"# {monitor['product_name']} 召回舆情周报")
+    md.append("")
+    md.append(f"> **报告周期**：{since} ~ {until}")
+    md.append(f"> **监测主题**：{monitor['recall_reason']}")
+    md.append(f"> **样本总数**：{len(samples)} 条")
+    md.append("")
+
+    md.append("## 📊 核心数据概览")
+    md.append("")
+    md.append("| 维度 | 详情 |")
+    md.append("|------|------|")
+    md.append(f"| 🔥 新增爆点 | {category_stats.get('新增爆点', 0)} 条 |")
+    md.append(f"| ❓ 主要质疑 | {category_stats.get('主要质疑', 0)} 条 |")
+    md.append(f"| 📢 官方回应 | {category_stats.get('官方回应', 0)} 条 |")
+    md.append(f"| ⚠️ 待核实传言 | {category_stats.get('待核实传言', 0)} 条 |")
+
+    plat_str = ", ".join(f"{k} {v}条" for k, v in sorted(platform_stats.items(), key=lambda x: x[1], reverse=True))
+    md.append(f"| 📱 平台分布 | {plat_str} |")
+
+    sent_str = ", ".join(f"{k} {v}条" for k, v in sorted(sentiment_stats.items(), key=lambda x: x[1], reverse=True))
+    md.append(f"| 😊 情绪分布 | {sent_str} |")
+
+    st_str = ", ".join(f"{k} {v}条" for k, v in sorted(status_stats.items(), key=lambda x: x[1], reverse=True))
+    md.append(f"| ✅ 状态分布 | {st_str} |")
+
+    if len(collector_stats) > 1 or "未标注" not in collector_stats:
+        col_str = ", ".join(f"{k} {v}条" for k, v in sorted(collector_stats.items(), key=lambda x: x[1], reverse=True))
+        md.append(f"| 👥 采集人 | {col_str} |")
+    md.append("")
+
+    if missing_platforms:
+        md.append(f"> ⚠️ **待补样本平台**：{', '.join(missing_platforms)}")
+        md.append("")
+
+    md.append("## 🔝 本周高互动样本 TOP 5")
+    md.append("")
+    for i, s in enumerate(top_samples, 1):
+        total_eng = _engagement(s)
+        md.append(f"### {i}. [#{s['id']}] {s['title']}")
+        md.append("")
+        md.append(f"- **互动量**：转发 {s['reposts']} | 评论 {s['comments']} | 合计 **{total_eng}**")
+        meta = []
+        if s.get("status"):
+            meta.append(s["status"])
+        if s.get("sentiment"):
+            meta.append(s["sentiment"])
+        if s.get("platform"):
+            meta.append(s["platform"])
+        if meta:
+            md.append(f"- **标签**：{' / '.join(meta)}")
+        if s.get("source_note"):
+            md.append(f"- **来源**：{s['source_note']}")
+        if s.get("link"):
+            md.append(f"- **链接**：{s['link']}")
+        md.append("")
+
+    for cat in valid_categories:
+        if cat not in category_stats or category_stats[cat] == 0:
+            continue
+        cat_samples = [s for s in samples if s.get("category") == cat]
+        cat_samples = sorted(cat_samples, key=_engagement, reverse=True)
+        md.append(f"## {category_labels.get(cat, cat)}（{len(cat_samples)} 条）")
+        md.append("")
+        for s in cat_samples[:3]:
+            total_eng = _engagement(s)
+            status_icon = {"已核验": "✅", "已采用": "📌", "待核实": "⚠️"}.get(s.get("status", ""), "")
+            md.append(f"- {status_icon} [#{s['id']}] **{s['title']}**")
+            md.append(f"  互动 {total_eng} · {s.get('sentiment', '')} · {s.get('platform', '')}")
+            if s.get("source_note"):
+                md.append(f"  来源：{s['source_note']}")
+        if len(cat_samples) > 3:
+            md.append(f"  ... 还有 {len(cat_samples) - 3} 条")
+        md.append("")
+
+    md.append("## 📈 趋势分析与建议")
+    md.append("")
+    md.append("### 本周观察")
+    md.append("")
+    md.append(f"- 舆情高峰出现在互动量最高的「{top_samples[0]['title'] if top_samples else 'N/A'}」")
+    md.append(f"- 情绪以 **{max(sentiment_stats, key=sentiment_stats.get) if sentiment_stats else 'N/A'}** 为主，需重点关注")
+    if category_stats.get("待核实传言", 0) > 0:
+        md.append(f"- 待核实传言 {category_stats['待核实传言']} 条，建议尽快核实真伪并统一回应口径")
+    if missing_platforms:
+        md.append(f"- 以下平台样本不足：{', '.join(missing_platforms)}，建议后续重点补充")
+    md.append("")
+    md.append("### 下周重点")
+    md.append("")
+    md.append("- [ ] 持续监测舆情热度变化")
+    md.append("- [ ] 核对待核实传言的真伪")
+    md.append("- [ ] 补充缺失平台的样本")
+    md.append("- [ ] 整理官方回应时间线")
+    md.append("")
+
+    md.append("---")
+    md.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+
+    md_text = "\n".join(md)
+    print(md_text)
+
+    if args.save or args.markdown:
+        filename = f"weekly_{monitor['id']}_{str(since).replace('-', '')}_{str(until).replace('-', '')}"
+        if args.status:
+            filename += f"_{args.status.replace(',', '_')}"
+        filename += ".md"
+        filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(md_text)
+        print(f"\n  📄 周报已保存至: {filepath}\n")
+
+
+def cmd_assign(args):
+    _ensure_dir()
+    monitor = _load_monitor(args.monitor_id)
+
+    all_samples = monitor["samples"]
+    target_platforms = monitor.get("platforms", [])
+    valid_categories = ["新增爆点", "主要质疑", "官方回应", "待核实传言"]
+
+    if not target_platforms:
+        print("\n  ❌ 该监测项目尚未设置目标平台，请先编辑项目配置。\n")
+        sys.exit(1)
+
+    today = date.today()
+    default_since = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    default_until = today.strftime("%Y-%m-%d")
+
+    since = _parse_date(args.since or default_since)
+    until = _parse_date(args.until or default_until)
+
+    samples = _filter_samples_by_date(all_samples, since, until)
+
+    if not all_samples:
+        print("\n  该监测项目尚无样本。\n")
+        sys.exit(0)
+
+    print(f"\n{'='*70}")
+    print(f"  👥 采集人分工统计")
+    print(f"{'='*70}")
+    print(f"  产品:       {monitor['product_name']}")
+    print(f"  召回原因:   {monitor['recall_reason']}")
+    print(f"  统计周期:   {since} ~ {until}")
+    print(f"  目标平台:   {', '.join(target_platforms)}")
+    print(f"  目标分类:   {', '.join(valid_categories)}")
+    print(f"  样本总数:   {len(samples)}（筛选期）/ {len(all_samples)}（全库）")
+    print(f"{'='*70}\n")
+
+    collector_data = {}
+    for s in samples:
+        col = s.get("collector", "").strip() or "未标注"
+        if col not in collector_data:
+            collector_data[col] = {
+                "total": 0,
+                "platforms": set(),
+                "categories": set(),
+                "statuses": {},
+                "avg_engagement": [],
+                "samples": []
+            }
+        collector_data[col]["total"] += 1
+        plat = s.get("platform", "").strip()
+        if plat:
+            collector_data[col]["platforms"].add(plat)
+        cat = s.get("category", "")
+        if cat:
+            collector_data[col]["categories"].add(cat)
+        st = s.get("status", "待核实")
+        collector_data[col]["statuses"][st] = collector_data[col]["statuses"].get(st, 0) + 1
+        collector_data[col]["avg_engagement"].append(_engagement(s))
+        collector_data[col]["samples"].append(s)
+
+    all_missing_platforms = set(target_platforms)
+    all_missing_categories = set(valid_categories)
+    for col_data in collector_data.values():
+        all_missing_platforms -= col_data["platforms"]
+        all_missing_categories -= col_data["categories"]
+
+    if "未标注" in collector_data and len(collector_data) > 1:
+        print(f"  ⚠  {len(collector_data['未标注'])} 条样本未标注采集人，请尽快补充\n")
+
+    for col, data in sorted(collector_data.items()):
+        if args.collector and col != args.collector:
+            continue
+
+        missing_platforms = set(target_platforms) - data["platforms"]
+        missing_categories = set(valid_categories) - data["categories"]
+
+        need_verify = data["statuses"].get("待核实", 0)
+        avg_eng = sum(data["avg_engagement"]) // max(len(data["avg_engagement"]), 1)
+
+        print(f"  👤 {col} （合计 {data['total']} 条，平均互动 {avg_eng}）")
+        print(f"  {'-'*50}")
+
+        status_parts = []
+        for st in ["已核验", "已采用", "待核实"]:
+            if data["statuses"].get(st, 0) > 0:
+                status_parts.append(f"{st} {data['statuses'][st]}")
+        if status_parts:
+            print(f"     ✅ 状态:   {', '.join(status_parts)}")
+
+        plat_covered = sorted(data["platforms"] & set(target_platforms))
+        if plat_covered:
+            print(f"     ✅ 已补平台: {', '.join(plat_covered)}")
+        if missing_platforms:
+            print(f"     ❌ 缺平台:   {', '.join(sorted(missing_platforms))}")
+
+        cat_covered = sorted(data["categories"] & set(valid_categories))
+        if cat_covered:
+            print(f"     ✅ 已补分类: {', '.join(cat_covered)}")
+        if missing_categories:
+            print(f"     ❌ 缺分类:   {', '.join(sorted(missing_categories))}")
+
+        if need_verify > 0:
+            print(f"     ⚠  待核实:   {need_verify} 条需核验")
+
+        print()
+
+    if all_missing_platforms or all_missing_categories:
+        print(f"{'='*70}")
+        print(f"  📋 全局未覆盖项")
+        print(f"{'='*70}")
+        if all_missing_platforms:
+            print(f"  ❌ 全员未覆盖平台: {', '.join(sorted(all_missing_platforms))}")
+        if all_missing_categories:
+            print(f"  ❌ 全员未覆盖分类: {', '.join(sorted(all_missing_categories))}")
+        print()
+
+    print(f"{'='*70}")
+    print(f"  🎯 今日分工建议")
+    print(f"{'='*70}")
+
+    priority_tasks = []
+    for col, data in collector_data.items():
+        if col == "未标注":
+            continue
+        missing_platforms = set(target_platforms) - data["platforms"]
+        missing_categories = set(valid_categories) - data["categories"]
+        need_verify = data["statuses"].get("待核实", 0)
+
+        if need_verify > 0:
+            priority_tasks.append(f"  🔴 {col}: 先核对待核实的 {need_verify} 条样本")
+        if missing_platforms:
+            for p in sorted(missing_platforms)[:2]:
+                priority_tasks.append(f"  🟡 {col}: 补充「{p}」平台的样本")
+        if missing_categories:
+            for c in sorted(missing_categories)[:1]:
+                priority_tasks.append(f"  🟢 {col}: 补充「{c}」分类的样本")
+
+    if not priority_tasks:
+        print("  ✅ 所有采集人均已完成目标平台和分类的覆盖！")
+    else:
+        for task in priority_tasks[:10]:
+            print(task)
+    print()
 
 
 def cmd_list(args):
