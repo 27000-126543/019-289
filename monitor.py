@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import hashlib
+import zipfile
 from datetime import datetime, date, timedelta
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -550,6 +551,65 @@ def _engagement(sample):
     return sample.get("reposts", 0) + sample.get("comments", 0)
 
 
+NEGATIVE_SENTIMENTS = {"愤怒", "担忧", "失望", "neg", "negative"}
+
+
+def _generate_trend_notes(all_samples, current_samples):
+    """根据样本生成几条可复制的观察结论。"""
+    notes = []
+
+    total = len(all_samples)
+    current = len(current_samples)
+    if total == 0:
+        return notes
+
+    today = date.today()
+    last_3 = [s for s in all_samples
+              if _parse_date(s.get("added_at", "")[:10])
+              and (today - _parse_date(s.get("added_at", "")[:10])).days <= 2]
+    prev_3 = [s for s in all_samples
+              if _parse_date(s.get("added_at", "")[:10])
+              and 2 < (today - _parse_date(s.get("added_at", "")[:10])).days <= 5]
+
+    if last_3 or prev_3:
+        if len(last_3) > len(prev_3) * 1.3 and len(prev_3) > 0:
+            delta_pct = (len(last_3) - len(prev_3)) / len(prev_3) * 100
+            notes.append(f"【增量】近 3 天新增 {len(last_3)} 条，较此前 3 天（{len(prev_3)} 条）上升 {delta_pct:.0f}%，舆情热度走高，建议加密监测频率。")
+        elif len(last_3) < len(prev_3) * 0.7 and len(prev_3) > 0:
+            delta_pct = (len(prev_3) - len(last_3)) / len(prev_3) * 100
+            notes.append(f"【增量】近 3 天新增 {len(last_3)} 条，较此前 3 天（{len(prev_3)} 条）下降 {delta_pct:.0f}%，舆情热度回落，可重点跟进后续处置进展。")
+        else:
+            notes.append(f"【增量】近 3 天新增 {len(last_3)} 条，此前 3 天 {len(prev_3)} 条，整体讨论热度保持平稳。")
+
+    neg_cur = sum(1 for s in current_samples if s.get("sentiment", "") in NEGATIVE_SENTIMENTS)
+    if current > 0:
+        neg_ratio = neg_cur / current
+        if neg_ratio >= 0.6:
+            notes.append(f"【情绪】当前筛选样本负面情绪占比 {neg_ratio * 100:.0f}%（{neg_cur}/{current}），以愤怒/担忧/失望为主，建议尽快准备统一回应口径。")
+        elif neg_ratio >= 0.4:
+            notes.append(f"【情绪】当前筛选样本负面情绪占比 {neg_ratio * 100:.0f}%（{neg_cur}/{current}），负面占比偏高，需持续跟踪是否发酵。")
+        else:
+            notes.append(f"【情绪】当前筛选样本负面情绪占比 {neg_ratio * 100:.0f}%（{neg_cur}/{current}），整体情绪尚可，重点关注高互动个体事件。")
+
+    pending_cur = sum(1 for s in current_samples if s.get("status", "待核实") == "待核实")
+    if current > 0:
+        pending_ratio = pending_cur / current
+        if pending_ratio >= 0.5:
+            notes.append(f"【核验】待核实样本 {pending_cur} 条，占比 {pending_ratio * 100:.0f}%，超过半数尚未核验，建议优先分配人手完成内容核真，避免报告引用不实信息。")
+        elif pending_ratio >= 0.3:
+            notes.append(f"【核验】待核实样本 {pending_cur} 条，占比 {pending_ratio * 100:.0f}%，建议尽快确认传言真伪，必要时联系官方或信源交叉验证。")
+        else:
+            notes.append(f"【核验】待核实样本 {pending_cur} 条，占比 {pending_ratio * 100:.0f}%，核验工作总体到位，可优先整理高互动内容形成周报材料。")
+
+    high_eng = sorted(current_samples, key=_engagement, reverse=True)[:3]
+    if high_eng and _engagement(high_eng[0]) >= 1000:
+        titles = "、".join(f"「{s['title'][:12]}…」" for s in high_eng if _engagement(s) >= 1000)
+        if titles:
+            notes.append(f"【高互动】{titles} 等样本互动量过千，是当前讨论焦点，建议作为周报重点案例单独分析。")
+
+    return notes
+
+
 def cmd_report(args):
     _ensure_dir()
     monitor = _load_monitor(args.monitor_id)
@@ -743,6 +803,14 @@ def cmd_report(args):
     if missing_platform_samples:
         ids = ", ".join(f"#{s['id']}" for s in missing_platform_samples)
         lines.append(f"  ⚠ 缺平台:     {ids}")
+
+    trend_notes = _generate_trend_notes(all_samples, samples)
+    if trend_notes:
+        lines.append("")
+        lines.append("  📝 趋势观察（可直接复制）")
+        lines.append("  " + "-" * 50)
+        for i, note in enumerate(trend_notes, 1):
+            lines.append(f"  {i}. {note}")
 
     lines.append("=" * 60)
 
@@ -976,8 +1044,13 @@ def cmd_weekly(args):
     md.append("")
     md.append("### 本周观察")
     md.append("")
-    md.append(f"- 舆情高峰出现在互动量最高的「{top_samples[0]['title'] if top_samples else 'N/A'}」")
-    md.append(f"- 情绪以 **{max(sentiment_stats, key=sentiment_stats.get) if sentiment_stats else 'N/A'}** 为主，需重点关注")
+
+    auto_notes = _generate_trend_notes(all_samples, samples)
+    for note in auto_notes:
+        md.append(f"- {note}")
+    if not auto_notes:
+        md.append(f"- 舆情高峰出现在互动量最高的「{top_samples[0]['title'] if top_samples else 'N/A'}」")
+        md.append(f"- 情绪以 **{max(sentiment_stats, key=sentiment_stats.get) if sentiment_stats else 'N/A'}** 为主，需重点关注")
     if category_stats.get("待核实传言", 0) > 0:
         md.append(f"- 待核实传言 {category_stats['待核实传言']} 条，建议尽快核实真伪并统一回应口径")
     if missing_platforms:
@@ -1172,12 +1245,350 @@ def cmd_list(args):
     print(f"{'='*60}\n")
 
 
+def cmd_export(args):
+    _ensure_dir()
+    monitor = _load_monitor(args.monitor_id)
+
+    all_samples = monitor["samples"]
+    if not all_samples:
+        print("\n  该监测项目尚无样本。\n")
+        sys.exit(0)
+
+    samples = list(all_samples)
+
+    since = _parse_date(args.since) if args.since else None
+    until = _parse_date(args.until) if args.until else None
+    samples = _filter_samples_by_date(samples, since, until)
+
+    if args.status:
+        samples = _filter_samples_by_status(samples, args.status)
+
+    if args.collector:
+        target_cols = {c.strip() for c in args.collector.split(",")}
+        samples = [s for s in samples
+                   if (s.get("collector", "").strip() or "未标注") in target_cols]
+
+    if args.platform:
+        target_plats = {p.strip() for p in args.platform.split(",")}
+        samples = [s for s in samples
+                   if (s.get("platform", "").strip() or "未标注") in target_plats]
+
+    if args.category:
+        target_cats = {c.strip() for c in args.category.split(",")}
+        samples = [s for s in samples
+                   if (s.get("category", "") in target_cats)]
+
+    if not samples:
+        print("\n  当前筛选条件下没有可导出的样本。\n")
+        sys.exit(0)
+
+    fmt = (args.format or "csv").lower()
+    if fmt not in {"csv", "md", "markdown"}:
+        print(f"\n  ❌ 不支持的格式「{fmt}，请使用 csv 或 md\n")
+        sys.exit(1)
+
+    header_cn = [
+        "编号", "标题", "链接", "转发", "评论", "互动合计",
+        "情绪", "分类", "状态", "来源", "平台", "采集人", "添加时间"
+    ]
+    header_en = [
+        "id", "title", "link", "reposts", "comments", "engagement",
+        "sentiment", "category", "status", "source", "platform", "collector", "added_at"
+    ]
+
+    rows = []
+    for s in samples:
+        row = {
+            "id": s["id"],
+            "title": s["title"],
+            "link": s["link"],
+            "reposts": s.get("reposts", 0),
+            "comments": s.get("comments", 0),
+            "engagement": _engagement(s),
+            "sentiment": s.get("sentiment", ""),
+            "category": s.get("category", ""),
+            "status": s.get("status", "待核实"),
+            "source": s.get("source_note", ""),
+            "platform": s.get("platform", ""),
+            "collector": s.get("collector", ""),
+            "added_at": s.get("added_at", ""),
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda r: (-r["engagement"], r["id"]))
+
+    today_str = date.today().strftime("%Y%m%d")
+    base_name = f"export_{monitor['id']}_{today_str}"
+    if args.status:
+        base_name += f"_{args.status.replace(',', '_').replace('!', 'not-')}"
+    if args.collector:
+        base_name += f"_cols{args.collector.replace(',', '_')}"
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = ""
+
+    if fmt == "csv":
+        file_path = os.path.join(base_dir, base_name + ".csv")
+        with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=header_en)
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        file_path = os.path.join(base_dir, base_name + ".md")
+        md_lines = []
+        md_lines.append(f"# {monitor['product_name']} 样本导出")
+        md_lines.append("")
+        md_lines.append(f"> 产品：{monitor['product_name']}")
+        md_lines.append(f"> 召回原因：{monitor['recall_reason']}")
+        filter_desc = []
+        if since or until:
+            rng = f"{since or '开始'} ~ {until or '今天'}"
+            filter_desc.append(f"日期：{rng}")
+        if args.status:
+            filter_desc.append(f"状态：{args.status}")
+        if args.collector:
+            filter_desc.append(f"采集人：{args.collector}")
+        if args.platform:
+            filter_desc.append(f"平台：{args.platform}")
+        if args.category:
+            filter_desc.append(f"分类：{args.category}")
+        if filter_desc:
+            md_lines.append(f"> 筛选条件：{' / '.join(filter_desc)}")
+        md_lines.append(f"> 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        md_lines.append(f"> 样本数：{len(rows)} 条")
+        md_lines.append("")
+        md_lines.append("| 编号 | 标题 | 分类 | 状态 | 情绪 | 平台 | 采集人 | 互动 | 来源 |")
+        md_lines.append("|------|------|------|------|------|------|--------|------|------|")
+        for r in rows:
+            title_short = r["title"]
+            if len(title_short) > 30:
+                title_short = title_short[:28] + "…"
+            md_lines.append(
+                f"| #{r['id']} | {title_short} | {r['category'] or '-'} | "
+                f"{r['status'] or '-'} | {r['sentiment'] or '-'} | "
+                f"{r['platform'] or '-'} | {r['collector'] or '-'} | "
+                f"{r['engagement']} | {r['source'] or '-'} |"
+            )
+        md_lines.append("")
+        md_lines.append("## 完整明细")
+        md_lines.append("")
+        for r in rows:
+            md_lines.append(f"### #{r['id']} {r['title']}")
+            md_lines.append("")
+            md_lines.append(f"- **分类**：{r['category'] or '-'}")
+            md_lines.append(f"- **状态**：{r['status'] or '-'}")
+            md_lines.append(f"- **情绪**：{r['sentiment'] or '-'}")
+            md_lines.append(f"- **平台**：{r['platform'] or '-'}")
+            md_lines.append(f"- **采集人**：{r['collector'] or '-'}")
+            md_lines.append(f"- **互动**：转发 {r['reposts']} / 评论 {r['comments']} / 合计 **{r['engagement']}**")
+            if r["link"]:
+                md_lines.append(f"- **链接**：{r['link']}")
+            if r["source"]:
+                md_lines.append(f"- **来源**：{r['source']}")
+            md_lines.append(f"- **添加时间**：{r['added_at']}")
+            md_lines.append("")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(md_lines))
+
+    print(f"\n{'='*60}")
+    print(f"  ✅ 导出成功")
+    print(f"{'='*60}")
+    print(f"  产品:       {monitor['product_name']}")
+    print(f"  导出数量:   {len(rows)} 条")
+    print(f"  文件格式:   {fmt.upper()}")
+    print(f"  保存路径:   {file_path}")
+    print(f"{'='*60}\n")
+
+
+def cmd_search(args):
+    _ensure_dir()
+    monitor = _load_monitor(args.monitor_id)
+
+    all_samples = monitor["samples"]
+    if not all_samples:
+        print("\n  该监测项目尚无样本。\n")
+        sys.exit(0)
+
+    samples = list(all_samples)
+
+    if args.keyword:
+        kw = args.keyword.strip().lower()
+        samples = [s for s in samples if kw in s["title"].lower()]
+
+    if args.platform:
+        plats = {p.strip() for p in args.platform.split(",")}
+        samples = [s for s in samples
+                   if (s.get("platform", "").strip() or "未标注") in plats]
+
+    if args.category:
+        cats = {c.strip() for c in args.category.split(",")}
+        samples = [s for s in samples if s.get("category", "") in cats]
+
+    if args.status:
+        samples = _filter_samples_by_status(samples, args.status)
+
+    if args.collector:
+        cols = {c.strip() for c in args.collector.split(",")}
+        samples = [s for s in samples
+                   if (s.get("collector", "").strip() or "未标注") in cols]
+
+    if args.sentiment:
+        sents = {s.strip() for s in args.sentiment.split(",")}
+        samples = [s for s in samples if s.get("sentiment", "") in sents]
+
+    if args.min_engagement:
+        samples = [s for s in samples if _engagement(s) >= args.min_engagement]
+
+    samples = sorted(samples, key=_engagement, reverse=True)
+
+    print(f"\n{'='*70}")
+    print(f"  🔍 样本搜索结果")
+    print(f"{'='*70}")
+    print(f"  产品:       {monitor['product_name']}")
+    print(f"  匹配数量:   {len(samples)} / {len(all_samples)} 条")
+    conditions = []
+    if args.keyword:
+        conditions.append(f"标题包含「{args.keyword}」")
+    if args.platform:
+        conditions.append(f"平台: {args.platform}")
+    if args.category:
+        conditions.append(f"分类: {args.category}")
+    if args.status:
+        conditions.append(f"状态: {args.status}")
+    if args.collector:
+        conditions.append(f"采集人: {args.collector}")
+    if args.sentiment:
+        conditions.append(f"情绪: {args.sentiment}")
+    if args.min_engagement:
+        conditions.append(f"互动 ≥ {args.min_engagement}")
+    if conditions:
+        print(f"  筛选条件:   {' / '.join(conditions)}")
+    print(f"{'='*70}\n")
+
+    if not samples:
+        print("  （无匹配结果，请放宽条件再试）\n")
+        return
+
+    for s in samples:
+        total_eng = _engagement(s)
+        print(f"  [#{s['id']}] {s['title']}")
+        meta = []
+        status_icon = {"已核验": "✅", "已采用": "📌", "待核实": "⚠️"}.get(s.get("status", ""), "")
+        if status_icon:
+            meta.append(f"{status_icon}{s.get('status', '')}")
+        if s.get("category"):
+            meta.append(f"分类: {s['category']}")
+        if s.get("sentiment"):
+            meta.append(f"情绪: {s['sentiment']}")
+        if s.get("platform"):
+            meta.append(f"平台: {s['platform']}")
+        if s.get("collector"):
+            meta.append(f"采集人: {s['collector']}")
+        if meta:
+            print(f"         {' | '.join(meta)}")
+        print(f"         互动: 转发{s.get('reposts', 0)} 评论{s.get('comments', 0)} / 合计 {total_eng}")
+        if s.get("link"):
+            print(f"         链接: {s['link']}")
+        if s.get("source_note"):
+            print(f"         来源: {s['source_note']}")
+        print()
+
+    print(f"  💡 编辑提示: python monitor.py edit {monitor['id']} <编号> --status 已核验\n")
+
+
+def cmd_backup(args):
+    _ensure_dir()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if not os.listdir(DATA_DIR):
+        print("\n  暂无可备份的监测项目。\n")
+        sys.exit(0)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.monitor_id:
+        _load_monitor(args.monitor_id)
+        file_name = f"backup_{args.monitor_id}_{ts}.zip"
+        include_files = [f"{args.monitor_id}.json"]
+    else:
+        file_name = f"backup_all_{ts}.zip"
+        include_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".json")]
+
+    file_path = os.path.join(base_dir, file_name)
+    with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in include_files:
+            full = os.path.join(DATA_DIR, fname)
+            zf.write(full, arcname=fname)
+            with open(full, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            print(f"  + {fname}  {m['product_name']}  ({len(m.get('samples', []))} 条样本)")
+
+    total = len(include_files)
+    size_kb = os.path.getsize(file_path) / 1024
+    print(f"\n{'='*60}")
+    print(f"  ✅ 备份完成")
+    print(f"{'='*60}")
+    print(f"  项目数量:   {total} 个")
+    print(f"  文件大小:   {size_kb:.1f} KB")
+    print(f"  备份文件:   {file_path}")
+    print(f"  恢复命令: python monitor.py restore \"{file_name}\"\n")
+
+
+def cmd_restore(args):
+    _ensure_dir()
+    backup_path = args.backup_file
+    if not os.path.exists(backup_path):
+        print(f"\n  ❌ 备份文件不存在: {backup_path}\n")
+        sys.exit(1)
+
+    if not zipfile.is_zipfile(backup_path):
+        print(f"\n  ❌ 不是有效的 zip 备份文件。\n")
+        sys.exit(1)
+
+    with zipfile.ZipFile(backup_path, "r") as zf:
+        members = [m for m in zf.namelist() if m.endswith(".json")]
+        if not members:
+            print("\n  ❌ 备份文件中未找到监测项目数据。\n")
+            sys.exit(1)
+
+        print(f"\n{'='*60}")
+        print(f"  🔄 备份内容预览")
+        print(f"{'='*60}")
+        preview = {}
+        for m in members:
+            with zf.open(m) as f:
+                data = json.load(f)
+            preview[m] = data
+            existed = os.path.exists(os.path.join(DATA_DIR, m))
+            tag = " [覆盖]" if existed else " [新增]"
+            print(f"  {m}{tag}  {data['product_name']}  ({len(data.get('samples', []))} 条样本)")
+
+        if not args.yes:
+            resp = input("\n  确认恢复? ([y]es / [N]o): ").strip().lower()
+            if resp not in {"y", "yes"}:
+                print("  已取消恢复。\n")
+                return
+
+        for m in members:
+            target = os.path.join(DATA_DIR, m)
+            if os.path.exists(target) and not args.force:
+                bak = target + ".bak_" + datetime.now().strftime("%Y%m%d%H%M%S")
+                with open(target, "r", encoding="utf-8") as f:
+                    with open(bak, "w", encoding="utf-8") as bf:
+                        bf.write(f.read())
+                print(f"  已备份旧文件: {os.path.basename(bak)}")
+            zf.extract(m, DATA_DIR)
+
+    print(f"\n{'='*60}")
+    print(f"  ✅ 恢复完成 ({len(members)} 个项目)")
+    print(f"{'='*60}\n")
+
+
 def _show_welcome():
     print(f"\n{'='*60}")
     print(f"  📊 产品召回舆情监测助手")
     print(f"{'='*60}")
     print(f"  面向舆情分析实习生和研究生团队的极简工具")
-    print(f"  六个命令：new / add / report / edit / weekly / assign")
+    print(f"  10 个命令：new / add / report / edit / weekly / assign / export / search / backup / restore")
     print(f"{'-'*60}")
     print(f"\n  📌 情绪分类（6 种）：")
     print(f"     愤怒 / 担忧 / 失望 / 中立 / 理解 / 支持")
@@ -1218,8 +1629,11 @@ def _show_welcome():
     print(f'     python monitor.py report <监测编号> --status "!待核实"')
     print(f"\n  📋 更多命令：")
     print(f'     edit   <编号> <样本ID> --status 已核验     编辑样本状态/分类等')
-    print(f'     weekly <编号> --since 2026-06-12 --save    生成 Markdown 周报')
+    print(f'     weekly <编号> --save                      生成 Markdown 周报')
     print(f'     assign <编号>                              按采集人列出缺项')
+    print(f'     export <编号> --format md --status 已核验  导出筛选结果')
+    print(f'     search <编号> --keyword 腹泻 --platform 微博  搜索样本')
+    print(f'     backup [编号] / restore <zip>              备份/恢复')
     print(f'     list                                       查看所有项目')
     print(f"\n{'='*60}\n")
 
@@ -1265,6 +1679,20 @@ def main():
   # 分工统计
   python monitor.py assign abc12345
   python monitor.py assign abc12345 --collector 张三
+
+  # 数据导出
+  python monitor.py export abc12345
+  python monitor.py export abc12345 --format md --status 已核验 --collector 张三
+  python monitor.py export abc12345 --since 2026-06-15 --until 2026-06-19 --save
+
+  # 搜索样本
+  python monitor.py search abc12345 --keyword 腹泻
+  python monitor.py search abc12345 --platform 微博 --status 待核实 --min-engagement 500
+
+  # 备份与恢复
+  python monitor.py backup                  # 备份全部项目
+  python monitor.py backup abc12345         # 只备份指定项目
+  python monitor.py restore backup_all_xxx.zip -y
 
   # 查看项目列表
   python monitor.py list
@@ -1340,6 +1768,35 @@ def main():
     p_assign.add_argument("--until", default="", help="统计截止日期（默认今天）")
     p_assign.add_argument("--collector", default="", help="只看指定采集人")
 
+    p_export = subparsers.add_parser("export", help="按条件导出样本为 CSV 或 Markdown 表格")
+    p_export.add_argument("monitor_id", help="监测项目编号")
+    p_export.add_argument("--format", default="csv",
+                          help="导出格式：csv（默认）/ md / markdown")
+    p_export.add_argument("--since", default="", help="起始日期（YYYY-MM-DD）")
+    p_export.add_argument("--until", default="", help="截止日期（YYYY-MM-DD）")
+    p_export.add_argument("--status", default="", help="状态筛选，如：已核验 / !待核实 / 已核验,已采用")
+    p_export.add_argument("--collector", default="", help="采集人筛选，逗号分隔")
+    p_export.add_argument("--platform", default="", help="平台筛选，逗号分隔")
+    p_export.add_argument("--category", default="", help="分类筛选，逗号分隔")
+
+    p_search = subparsers.add_parser("search", help="按关键词/平台/分类/状态/采集人组合搜索样本")
+    p_search.add_argument("monitor_id", help="监测项目编号")
+    p_search.add_argument("--keyword", default="", help="标题关键词（不区分大小写）")
+    p_search.add_argument("--platform", default="", help="平台筛选，逗号分隔")
+    p_search.add_argument("--category", default="", help="分类筛选，逗号分隔")
+    p_search.add_argument("--status", default="", help="状态筛选，如：已核验 / !待核实")
+    p_search.add_argument("--collector", default="", help="采集人筛选，逗号分隔")
+    p_search.add_argument("--sentiment", default="", help="情绪筛选，逗号分隔")
+    p_search.add_argument("--min-engagement", type=int, default=0, help="最小互动量阈值")
+
+    p_backup = subparsers.add_parser("backup", help="备份单项目或全部项目为 zip 包")
+    p_backup.add_argument("monitor_id", nargs="?", default="", help="监测项目编号（留空=全部）")
+
+    p_restore = subparsers.add_parser("restore", help="从 zip 备份文件恢复监测项目")
+    p_restore.add_argument("backup_file", help="备份 zip 文件路径")
+    p_restore.add_argument("-y", "--yes", action="store_true", help="跳过确认直接恢复")
+    p_restore.add_argument("--force", action="store_true", help="覆盖旧文件且不备份")
+
     subparsers.add_parser("list", help="列出所有监测项目及样本数量")
 
     args = parser.parse_args()
@@ -1360,6 +1817,14 @@ def main():
         cmd_weekly(args)
     elif args.command == "assign":
         cmd_assign(args)
+    elif args.command == "export":
+        cmd_export(args)
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "backup":
+        cmd_backup(args)
+    elif args.command == "restore":
+        cmd_restore(args)
     elif args.command == "list":
         cmd_list(args)
     else:
